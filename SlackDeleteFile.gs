@@ -1,19 +1,22 @@
 /* 引数 */
-var days = 1; // 日以上経過したら削除
-var ignoreType = "spaces,images"; // 削除対象にしないファイル形式
-var targetChannels = ['test_channel']// 対象にしたいチャンネル
+var days = 365; // 日以上経過したら削除
+var ignoreType = "spaces"; // 削除対象にしないファイル形式(spacesは通常の投稿)
+var interval = 6; // 削除間隔
 
+/* スコープを与える */
+var SlackDelFileApp = {}
 
 /* 削除処理 */
 function deleteOldFile(){
-  targetChannels.forEach(function(channelName){
-    var channelId = SlackDelFileApp.getId(channelName, 'channels') || SlackDelFileApp.getId(channelName, 'groups');
-    if(channelId === ''){
-    Logger.log('Not found "' + channelName + '". Skip');
-    return -1; // チャンネルが無ければ終了
-    }
-    Logger.log('Found "' + channelName + '"(id => "' + channelId + '")');
-    
+
+  // 全てのチャンネルを取得する
+  var res = SlackDelFileApp.getAllChannels("conversations.list");
+
+  // チャンネルを1つずつ
+  res.channels.forEach(function(channelData){
+    var channelName = channelData.name;
+    var channelId = channelData.id;
+
     var deleteFiles = SlackDelFileApp.getFileListWithOutOption(channelId, days, ignoreType); // 削除対象を取得
 
     deleteFiles.files.forEach(function(file){ // 削除
@@ -24,19 +27,11 @@ function deleteOldFile(){
          Logger.log('  Deleted file "' + file.name + '"(id => "' + file.id + '")');
       }
     });
+
+    // 次回削除予定ファイルの通知
+    SlackDelFileApp.postConfirm(channelName, channelId, days + 6, ignoreType)
   });
 }
-
-/* メッセージ送信 */
-function postDeleteFileMessage(channelId, botName, message){
-
-  targetChannels.forEach(function(channelName){
-  Logger.log(SlackDelFileApp.postConfirm(channelName, days, ignoreType));
-  });
-}
-
-/* スコープを与える */
-var SlackDelFileApp = {}
 
 /* SLACKのTOKENを読み込み */
 SlackDelFileApp.SLACK_ACCESS_TOKEN = PropertiesService.getScriptProperties().getProperty('SLACK_ACCESS_TOKEN');// slackで発行したTOKENをGASの環境変数に設定
@@ -52,12 +47,30 @@ SlackDelFileApp.execute = function(method, params){
   return JSON.parse(res.getContentText());
 }
 
+SlackDelFileApp.get = function(method, params){
+  if (params === undefined ) params = {'token' : SlackDelFileApp.SLACK_ACCESS_TOKEN};
+  var options = {
+    'token' : SlackDelFileApp.SLACK_ACCESS_TOKEN ,
+    'method': 'GET',
+  }
+  var res = UrlFetchApp.fetch('https://slack.com/api/' + method + '?'+ SlackDelFileApp.getAsUriParameters(params), options);
+  return JSON.parse(res.getContentText());
+}
+
+SlackDelFileApp.getAsUriParameters = function(data) {
+   var url = '';
+   for (var prop in data) {
+      url += encodeURIComponent(prop) + '=' + 
+          encodeURIComponent(data[prop]) + '&';
+   }
+   return url.substring(0, url.length - 1)
+}
+
 /* 翌日の削除対象ファイルの確認 */
-SlackDelFileApp.postConfirm = function(channelName, days, ignoreType){
-  var channelId = SlackDelFileApp.getId(channelName, 'channels') || SlackDelFileApp.getId(channelName, 'groups');
-  var deleteFiles = this.getFileListWithOutOption(channelId, days + 1, ignoreType); // 翌日の削除対象を取得
-  var nullMsg = '明日の削除対象ファイルはありません';
-  var listMsg = '明日の削除対象ファイルは以下 ' + deleteFiles.files.length + ' 件のファイルです。';
+SlackDelFileApp.postConfirm = function(channelName, channelId, elapsedDaysNext, ignoreType){
+  var deleteFiles = this.getFileListWithOutOption(channelId, elapsedDaysNext, ignoreType); // 翌日の削除対象を取得
+  if(deleteFiles.files.length == 0) return;
+  var listMsg = (interval + 1) + '日後の削除対象ファイルは以下 ' + deleteFiles.files.length + ' 件のファイルです。';
   
   deleteFiles.files.forEach(function(f){
     listMsg +=  "\n\t・" + f.name ; 
@@ -67,7 +80,7 @@ SlackDelFileApp.postConfirm = function(channelName, days, ignoreType){
     'token': SlackDelFileApp.SLACK_ACCESS_TOKEN,
     'channel': channelName,
     'username' : 'ファイル削除botくん', //投稿するbotの名前
-    'text'     : deleteFiles.files.length == 0 ? nullMsg : listMsg //投稿するメッセージ
+    'text'     : listMsg //投稿するメッセージ
   }
   return this.execute('chat.postMessage', params);
 }
@@ -79,12 +92,6 @@ SlackDelFileApp.deleteFile = function(id){
     'file' : id // delete対象はidで指定
   }
  return this.execute('files.delete', params);
-}
-
-/* ファイルのリスト取得 */ // unused
-SlackDelFileApp.getFilesList = function(params){
-  params.token = SlackDelFileApp.SLACK_ACCESS_TOKEN;
-   return this.execute('files.list', params);
 }
 
 /* チャネル名（グループ名）からidを取得 */
@@ -105,6 +112,14 @@ SlackDelFileApp.getId = function(name, type) { // 公開->channel 非公開->gro
     } 
   });
   return channelId;
+}
+
+SlackDelFileApp.getAllChannels = function(){
+  var params = {
+    'token'	: SlackDelFileApp.SLACK_ACCESS_TOKEN,
+    'types' : 'public_channel,private_channel,mpim,im'
+  };
+  return this.get('conversations.list',params);
 }
 
 /* 日付　->　秒変換　->　日時*/
@@ -130,6 +145,9 @@ SlackDelFileApp.getFileListWithOutOption = function(channelId, days, ignoreType,
   
   var getDiffs = function(listAll,listIgnore){
     var diffs = [];
+    
+    if(listAll == undefined) return diffs;
+    
     listAll.forEach(function(a){
       var exist = false;
       listIgnore.forEach(function(i){
